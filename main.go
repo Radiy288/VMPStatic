@@ -311,7 +311,10 @@ func detectVMProtect(data []byte) VMPResult {
 	if err != nil {
 		return VMPResult{}
 	}
+	return detectVMProtectPE(pe)
+}
 
+func detectVMProtectPE(pe *PEFile) VMPResult {
 	if pe.isNetAssembly() {
 		return VMPResult{}
 	}
@@ -339,7 +342,7 @@ func detectVMProtect(data []byte) VMPResult {
 		result = detectByDeepScan(pe)
 	}
 
-	result = checkPackedVariant(data, pe, result)
+	result = checkPackedVariant(pe.data, pe, result)
 
 	if result.Detected && len(pe.sections) < 3 {
 		if len(pe.sections) == 3 && pe.sections[0].SizeOfRawData == 0 {
@@ -349,6 +352,66 @@ func detectVMProtect(data []byte) VMPResult {
 		}
 	}
 
+	return result
+}
+
+func versionNeedsLayoutRefine(v string) bool {
+	switch v {
+	case "", "2.X", "2.XX-3.XX", "1.X-3.XX", "old", "new":
+		return true
+	default:
+		return false
+	}
+}
+
+type packerLocate struct {
+	legacy  bool
+	v39     bool
+	piBase  int
+	props   []byte
+	entries []PackerInfo
+}
+
+func locatePackerInfo(pe *PEFile, dests []SectionInfo) (packerLocate, error) {
+	var loc packerLocate
+	piBase, props, legacy := findPackerInfoLegacy(pe, dests)
+	if legacy {
+		loc.legacy = true
+		loc.piBase = piBase
+		loc.props = props
+		for i := range dests {
+			entryOff := piBase + i*8
+			if entryOff+8 > len(pe.data) {
+				return loc, fmt.Errorf("PACKER_INFO[%d] is out of file bounds", i)
+			}
+			loc.entries = append(loc.entries, PackerInfo{
+				Src: binary.LittleEndian.Uint32(pe.data[entryOff:]),
+				Dst: binary.LittleEndian.Uint32(pe.data[entryOff+4:]),
+			})
+		}
+		return loc, nil
+	}
+
+	piBase, entries, found := findPackerInfoV39(pe, dests)
+	if !found {
+		return loc, fmt.Errorf("could not locate PACKER_INFO in packed PE")
+	}
+	loc.v39 = true
+	loc.piBase = piBase
+	loc.entries = entries
+	loc.props = defaultLZMAProps
+	return loc, nil
+}
+
+func refineVersionByPackerLayout(pe *PEFile, result VMPResult, loc packerLocate) VMPResult {
+	if !result.Detected || !versionNeedsLayoutRefine(result.Version) || !loc.v39 {
+		return result
+	}
+	if v := detectVMP310(pe); v.Detected {
+		result.Version = v.Version
+	} else {
+		result.Version = "3.9+"
+	}
 	return result
 }
 
@@ -1107,7 +1170,11 @@ func unpackPE(data []byte) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse packed PE: %w", err)
 	}
+	return unpackPEFile(pe, nil)
+}
 
+func unpackPEFile(pe *PEFile, loc *packerLocate) ([]byte, error) {
+	data := pe.data
 	unpacked := make([]byte, pe.sizeOfImage)
 
 	if int(pe.sizeOfHeaders) > len(data) {
@@ -1146,34 +1213,26 @@ func unpackPE(data []byte) ([]byte, error) {
 		return unpacked, nil
 	}
 
-	var entries []PackerInfo
-
-	piBase, lzmaProps, legacy := findPackerInfoLegacy(pe, dests)
-	if legacy {
-		for i := range dests {
-			entryOff := piBase + i*8
-			if entryOff+8 > len(data) {
-				return nil, fmt.Errorf("PACKER_INFO[%d] is out of file bounds", i)
-			}
-			entries = append(entries, PackerInfo{
-				Src: binary.LittleEndian.Uint32(data[entryOff:]),
-				Dst: binary.LittleEndian.Uint32(data[entryOff+4:]),
-			})
-		}
-		fmt.Printf("PACKER_INFO at file offset 0x%X: %d plaintext {Src,Dst} entries, LZMA props %X\n",
-			piBase, len(entries), lzmaProps)
+	var resolved packerLocate
+	if loc != nil {
+		resolved = *loc
 	} else {
-		var found bool
-		piBase, entries, found = findPackerInfoV39(pe, dests)
-		if !found {
-			return nil, fmt.Errorf("could not locate PACKER_INFO in packed PE")
+		var err error
+		resolved, err = locatePackerInfo(pe, dests)
+		if err != nil {
+			return nil, err
 		}
-		lzmaProps = defaultLZMAProps
-		fmt.Printf("PACKER_INFO at file offset 0x%X: %d {Src,Dst^key} entries, implicit LZMA props %X (3.9+ layout)\n",
-			piBase, len(entries), lzmaProps)
+	}
+	if resolved.legacy {
+		fmt.Printf("PACKER_INFO at file offset 0x%X: %d plaintext {Src,Dst} entries, LZMA props %X\n",
+			resolved.piBase, len(resolved.entries), resolved.props)
+	} else {
+		fmt.Printf("PACKER_INFO at file offset 0x%X: %d {Src,Dst^key} entries, implicit LZMA props %X\n", //3.9+ layout
+			resolved.piBase, len(resolved.entries), resolved.props)
 	}
 
-	for i, entry := range entries {
+	lzmaProps := resolved.props
+	for i, entry := range resolved.entries {
 		compRawOff, err := rvaToRawOffset(pe, entry.Src)
 		if err != nil {
 			return nil, fmt.Errorf("block %d: failed to resolve compressed data RVA 0x%X: %w", i, entry.Src, err)
@@ -1476,13 +1535,21 @@ func main() {
 	}
 	fmt.Printf("Loaded %q — %d bytes\n\n", packedPath, len(data))
 
-	_, err = parsePE(data)
+	pe, err := parsePE(data)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error parsing pe file: %v\n", err)
 		os.Exit(1)
 	}
 
-	vmpResult := detectVMProtect(data)
+	vmpResult := detectVMProtectPE(pe)
+
+	var loc *packerLocate
+	if dests := packedSections(pe); len(dests) > 0 {
+		if found, locErr := locatePackerInfo(pe, dests); locErr == nil {
+			loc = &found
+			vmpResult = refineVersionByPackerLayout(pe, vmpResult, found)
+		}
+	}
 
 	if !vmpResult.Detected {
 		fmt.Println("Warning: VMProtect signature not found. The file may still be packed")
@@ -1491,7 +1558,7 @@ func main() {
 	}
 
 	fmt.Printf("\n")
-	unpacked, err := unpackPE(data)
+	unpacked, err := unpackPEFile(pe, loc)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "\nUnpacking failed: %v\n", err)
 		os.Exit(1)
